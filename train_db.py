@@ -143,7 +143,7 @@ class DreamBoothOrFineTuningDataset(torch.utils.data.Dataset):
     bucket_aspect_ratios = np.array(bucket_aspect_ratios)
 
     # 画像の解像度、latentをあらかじめ取得する
-    img_ar_errors = []
+    img_ar_errors = {}
     self.size_lat_cache = {}
     for image_path, _ in tqdm(self.train_img_path_captions + self.reg_img_path_captions):
       if image_path in self.size_lat_cache:
@@ -163,7 +163,7 @@ class DreamBoothOrFineTuningDataset(torch.utils.data.Dataset):
         bucket_id = np.abs(ar_errors).argmin()
         reso = bucket_resos[bucket_id]
         ar_error = ar_errors[bucket_id]
-        img_ar_errors.append(ar_error)
+        img_ar_errors[image_path] = ar_error
 
         if cache_latents:
           image = self.resize_and_trim(image, reso)
@@ -192,6 +192,51 @@ class DreamBoothOrFineTuningDataset(torch.utils.data.Dataset):
 
     split_to_buckets(False, self.train_img_path_captions)
 
+    def get_most_similar_bucket(bucket_index):
+      reso = bucket_resos[bucket_index]
+      prev_reso = bucket_resos[bucket_index - 1]
+      next_reso = bucket_resos[bucket_index + 1 if bucket_index + 1 < len(bucket_resos) else 0]
+      prev_diff = abs(reso[0] - prev_reso[0]) + abs(reso[1] - prev_reso[1])
+      next_diff = abs(reso[0] - next_reso[0]) + abs(reso[1] - next_reso[1])
+      if prev_diff < next_diff:
+        return bucket_index - 1
+      return bucket_index + 1
+
+    def combine_buckets():
+      while any(len(bucket) < self.batch_size for bucket in self.buckets):
+        for i, bucket in enumerate(self.buckets):
+          if len(bucket) >= self.batch_size:
+            continue
+          closest_bucket = get_most_similar_bucket(i)
+
+          for is_reg, image_path, caption in bucket:
+            image = self.load_image(image_path)[0]
+            image_height, image_width = image.shape[0:2]
+            aspect_ratio = image_width / image_height
+            ar_error = bucket_aspect_ratios[closest_bucket] - aspect_ratio
+            img_ar_errors[image_path] = ar_error
+
+            if cache_latents:
+              image = self.resize_and_trim(image, bucket_resos[closest_bucket])
+              img_tensor = self.image_transforms(image)
+              img_tensor = img_tensor.unsqueeze(0).to(device=vae.device, dtype=vae.dtype)
+              latents = vae.encode(img_tensor).latent_dist.sample().squeeze(0).to("cpu")
+            else:
+              latents = None
+            
+            self.size_lat_cache[image_path] = (bucket_resos[closest_bucket], latents)
+            
+            self.buckets[closest_bucket].append((is_reg, image_path, caption))
+
+          self.buckets.pop(i)
+          bucket_resos.pop(i)
+          bucket_aspect_ratios = np.array([reso[0] / reso[1] for reso in bucket_resos])
+          break
+
+    if enable_bucket:
+      print("combining buckets / bucketを統合")
+      combine_buckets()
+
     if self.enable_reg_images:
       l = []
       while len(l) < len(self.train_img_path_captions):
@@ -203,8 +248,7 @@ class DreamBoothOrFineTuningDataset(torch.utils.data.Dataset):
       print("number of images with repeats / 繰り返し回数込みの各bucketの画像枚数")
       for i, (reso, imgs) in enumerate(zip(bucket_resos, self.buckets)):
         print(f"bucket {i}: resolution {reso}, count: {len(imgs)}")
-      img_ar_errors = np.array(img_ar_errors)
-      print(f"mean ar error: {np.mean(np.abs(img_ar_errors))}")
+      print(f"mean ar error: {np.mean(np.abs(np.array(list(img_ar_errors.values()))))}")
 
     # 参照用indexを作る
     self.buckets_indices = []
