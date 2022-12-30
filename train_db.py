@@ -225,6 +225,9 @@ class DreamBoothOrFineTuningDataset(torch.utils.data.Dataset):
               latents = None
             
             self.size_lat_cache[image_path] = (bucket_resos[closest_bucket], latents)
+
+            if abs(ar_error) > 0.1 and "cropped" not in caption:
+              caption = caption + ", cropped"
             
             self.buckets[closest_bucket].append((is_reg, image_path, caption))
 
